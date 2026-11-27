@@ -57,6 +57,7 @@
 #include <poll.h>
 #include <string.h>
 #include <pthread.h>
+#include "pfring_flow_balance.h"
 #include <linux/pf_ring.h>
 #include <linux/if_ether.h>
 
@@ -368,6 +369,9 @@ struct __pfring {
   pfring *one_copy_rx_pfring;
 
   pthread_t runtime_manager_thread;
+
+  /* Optional flow-affinity/load-statistics layer; NULL unless enabled. */
+  pfring_flow_balancer *flow_balancer;
 };
 
 /* ********************************* */
@@ -494,6 +498,54 @@ void pfring_close(pfring *ring);
  * @return 0 on uccess, a negative value otherwise.
  */
 int pfring_stats(pfring *ring, pfring_stat *stats);
+
+/**
+ * Enable optional per-flow queue affinity and per-CPU/queue statistics.
+ * Existing sockets and pfring_stats() remain unchanged.
+ */
+int pfring_enable_flow_balance(pfring *ring, u_int32_t num_queues);
+
+/** Return the embedded balancer, or NULL when flow balancing is disabled. */
+pfring_flow_balancer *pfring_get_flow_balancer(pfring *ring);
+
+/**
+ * Parse one received packet, pin its flow to a queue, and update stats.
+ * Pass PFRING_FB_CPU_UNKNOWN to account for the calling CPU.
+ */
+int pfring_flow_balance_observe(pfring *ring,
+                                const struct pfring_pkthdr *hdr,
+                                const u_char *packet,
+                                u_int32_t cpu_id,
+                                u_int32_t *queue_id);
+
+/** pfring_recv() followed by flow queue selection and statistics update. */
+int pfring_recv_balanced(pfring *ring, u_char **buffer, u_int buffer_len,
+                         struct pfring_pkthdr *hdr,
+                         u_int8_t wait_for_incoming_packet,
+                         u_int32_t cpu_id, u_int32_t *queue_id);
+
+/** Copy up to max_stats per-queue counters and set count to queue count. */
+int pfring_get_queue_drop_stats(pfring *ring,
+                                pfring_fb_queue_stats *stats,
+                                u_int32_t max_stats,
+                                u_int32_t *count);
+
+int pfring_get_flow_balance_snapshot(pfring *ring,
+                                     pfring_fb_snapshot *snapshot);
+
+/** Export queue/CPU/drop counters as JSON ("-" means stdout). */
+int pfring_export_flow_balance_json(pfring *ring, const char *path);
+
+/**
+ * Aggregate legacy pfring_stats() counters from one socket per RX queue.
+ * rings[i] is exported as queue i; JSON uses the same queue schema as the
+ * flow balancer.
+ */
+int pfring_get_socket_queue_stats(pfring **rings, u_int32_t num_rings,
+                                  pfring_fb_queue_stats *stats,
+                                  u_int32_t *count);
+int pfring_export_socket_queue_stats(pfring **rings, u_int32_t num_rings,
+                                     const char *path);
 
 /**
  * This call returns an incoming packet when available. 

@@ -14,6 +14,7 @@
 #define __USE_XOPEN2K
 #include <sys/types.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #ifndef _NETINET_IF_ETHER_H
 #define _NETINET_IF_ETHER_H /* fixes compilation with musl library */
@@ -403,6 +404,11 @@ void pfring_close(pfring *ring) {
   if(ring->one_copy_rx_pfring)
     pfring_close(ring->one_copy_rx_pfring);
 
+  if(ring->flow_balancer) {
+    pfring_fb_destroy(ring->flow_balancer);
+    ring->flow_balancer = NULL;
+  }
+
   pfring_shutdown(ring);
 
   pfring_sync_indexes_with_kernel(ring);
@@ -564,6 +570,225 @@ int pfring_stats(pfring *ring, pfring_stat *stats) {
   }
 
   return(PF_RING_ERROR_NOT_SUPPORTED);
+}
+
+/* **************************************************** */
+
+int pfring_enable_flow_balance(pfring *ring, u_int32_t num_queues) {
+  pfring_flow_balancer *fb;
+  long configured_cpus;
+  u_int32_t max_cpus;
+
+  if(ring == NULL || num_queues == 0 || num_queues > PFRING_FB_MAX_QUEUES)
+    return(PF_RING_ERROR_INVALID_ARGUMENT);
+
+  if(ring->flow_balancer != NULL)
+    return(0);
+
+  configured_cpus = sysconf(_SC_NPROCESSORS_CONF);
+  max_cpus = configured_cpus > 0 ? (u_int32_t)configured_cpus : 0;
+  fb = pfring_fb_create(num_queues, max_cpus);
+  if(fb == NULL)
+    return(PF_RING_ERROR_NOT_ENOUGH_MEMORY);
+
+  ring->flow_balancer = fb;
+  return(0);
+}
+
+/* **************************************************** */
+
+pfring_flow_balancer *pfring_get_flow_balancer(pfring *ring) {
+  return(ring ? ring->flow_balancer : NULL);
+}
+
+/* **************************************************** */
+
+int pfring_flow_balance_observe(pfring *ring,
+                                const struct pfring_pkthdr *hdr,
+                                const u_char *packet,
+                                u_int32_t cpu_id,
+                                u_int32_t *queue_id) {
+  pfring_fb_key key;
+  size_t caplen;
+  int rc;
+
+  if(ring == NULL || ring->flow_balancer == NULL)
+    return(PF_RING_ERROR_NOT_SUPPORTED);
+  if(hdr == NULL || packet == NULL)
+    return(PF_RING_ERROR_INVALID_ARGUMENT);
+
+  caplen = hdr->caplen;
+  rc = pfring_fb_key_parse(packet, caplen, &key);
+  if(rc != PFRING_FB_OK)
+    return(rc);
+
+  return(pfring_fb_dispatch(ring->flow_balancer, &key, cpu_id,
+                           hdr->len ? hdr->len : caplen, queue_id));
+}
+
+/* **************************************************** */
+
+int pfring_recv_balanced(pfring *ring, u_char **buffer, u_int buffer_len,
+                         struct pfring_pkthdr *hdr,
+                         u_int8_t wait_for_incoming_packet,
+                         u_int32_t cpu_id, u_int32_t *queue_id) {
+  int rc = pfring_recv(ring, buffer, buffer_len, hdr,
+                       wait_for_incoming_packet);
+
+  if(rc > 0 && ring != NULL && ring->flow_balancer != NULL
+     && buffer != NULL && *buffer != NULL && hdr != NULL) {
+    pfring_flow_balance_observe(ring, hdr, *buffer, cpu_id, queue_id);
+  }
+
+  return(rc);
+}
+
+/* **************************************************** */
+
+int pfring_get_queue_drop_stats(pfring *ring,
+                                pfring_fb_queue_stats *stats,
+                                u_int32_t max_stats,
+                                u_int32_t *count) {
+  pfring_fb_snapshot snapshot;
+  u_int32_t i, n;
+  int rc;
+
+  if(count != NULL)
+    *count = 0;
+
+  if(ring == NULL || ring->flow_balancer == NULL || stats == NULL
+     || max_stats == 0)
+    return(PF_RING_ERROR_INVALID_ARGUMENT);
+
+  rc = pfring_fb_get_snapshot(ring->flow_balancer, &snapshot);
+  if(rc != PFRING_FB_OK)
+    return(rc);
+
+  n = snapshot.num_queues < max_stats ? snapshot.num_queues : max_stats;
+  for(i = 0; i < n; i++)
+    stats[i] = snapshot.queues[i];
+
+  if(count != NULL)
+    *count = snapshot.num_queues;
+
+  return(0);
+}
+
+/* **************************************************** */
+
+int pfring_get_flow_balance_snapshot(pfring *ring,
+                                     pfring_fb_snapshot *snapshot) {
+  if(ring == NULL || ring->flow_balancer == NULL || snapshot == NULL)
+    return(PF_RING_ERROR_INVALID_ARGUMENT);
+
+  return(pfring_fb_get_snapshot(ring->flow_balancer, snapshot));
+}
+
+/* **************************************************** */
+
+int pfring_export_flow_balance_json(pfring *ring, const char *path) {
+  if(ring == NULL || ring->flow_balancer == NULL || path == NULL)
+    return(PF_RING_ERROR_INVALID_ARGUMENT);
+
+  return(pfring_fb_export_json(ring->flow_balancer, path));
+}
+
+/* **************************************************** */
+
+int pfring_get_socket_queue_stats(pfring **rings, u_int32_t num_rings,
+                                  pfring_fb_queue_stats *stats,
+                                  u_int32_t *count) {
+  u_int32_t i;
+
+  if(count != NULL)
+    *count = 0;
+
+  if(rings == NULL || stats == NULL || num_rings == 0
+     || num_rings > PFRING_FB_MAX_QUEUES)
+    return(PF_RING_ERROR_INVALID_ARGUMENT);
+
+  memset(stats, 0, num_rings * sizeof(stats[0]));
+
+  for(i = 0; i < num_rings; i++) {
+    pfring_stat legacy_stats;
+    int rc;
+
+    stats[i].queue_id = i;
+    if(rings[i] == NULL)
+      continue;
+
+    memset(&legacy_stats, 0, sizeof(legacy_stats));
+    rc = pfring_stats(rings[i], &legacy_stats);
+    if(rc == 0) {
+      stats[i].packets = legacy_stats.recv;
+      stats[i].received_packets = legacy_stats.recv + legacy_stats.drop;
+      stats[i].drops = legacy_stats.drop;
+    }
+  }
+
+  if(count != NULL)
+    *count = num_rings;
+
+  return(0);
+}
+
+/* **************************************************** */
+
+int pfring_export_socket_queue_stats(pfring **rings, u_int32_t num_rings,
+                                     const char *path) {
+  pfring_fb_snapshot *snapshot;
+  char *json;
+  FILE *out;
+  u_int32_t i;
+  int rc;
+
+  if(path == NULL || num_rings == 0 || num_rings > PFRING_FB_MAX_QUEUES)
+    return(PF_RING_ERROR_INVALID_ARGUMENT);
+
+  snapshot = calloc(1, sizeof(*snapshot));
+  if(snapshot == NULL)
+    return(PF_RING_ERROR_NOT_ENOUGH_MEMORY);
+
+  snapshot->api_version = PFRING_FB_API_VERSION;
+  snapshot->num_queues = num_rings;
+  rc = pfring_get_socket_queue_stats(rings, num_rings, snapshot->queues,
+                                     &snapshot->num_queues);
+  if(rc != 0) {
+    free(snapshot);
+    return(rc);
+  }
+
+  for(i = 0; i < num_rings; i++) {
+    snapshot->packets += snapshot->queues[i].packets;
+    snapshot->received_packets += snapshot->queues[i].received_packets;
+    snapshot->drops += snapshot->queues[i].drops;
+  }
+
+  json = pfring_fb_snapshot_json(snapshot);
+  free(snapshot);
+  if(json == NULL)
+    return(PF_RING_ERROR_NOT_ENOUGH_MEMORY);
+
+  if(strcmp(path, "-") == 0) {
+    fputs(json, stdout);
+    free(json);
+    return(0);
+  }
+
+  out = fopen(path, "w");
+  if(out == NULL) {
+    free(json);
+    return(PF_RING_ERROR_GENERIC);
+  }
+
+  fputs(json, out);
+  if(fclose(out) != 0) {
+    free(json);
+    return(PF_RING_ERROR_GENERIC);
+  }
+
+  free(json);
+  return(0);
 }
 
 /* **************************************************** */

@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid43109",
+  "B": "/home/dev/feedback/uid43109",
+  "sha": "15e710495c604a37aeb2fe9c7fc5de88d857dc9b",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "ntop",
+    "repo": "PF_RING",
+    "sha": "15e710495c604a37aeb2fe9c7fc5de88d857dc9b"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "PF_RING",
+    "cloneUrl": "https://github.com/Rrr119/PF_RING.git"
+  },
+  "at": "2026-11-27T05:37:46.178Z"
+}
